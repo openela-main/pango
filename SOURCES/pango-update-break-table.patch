@@ -1,0 +1,175 @@
+Index: pango-1.42.4/pango/break.c
+===================================================================
+--- pango-1.42.4.orig/pango/break.c
++++ pango-1.42.4/pango/break.c
+@@ -409,15 +409,6 @@ pango_default_break (const gchar   *text
+ 	    GB_type = GB_ControlCRLF;
+ 	    break;
+ 
+-	  case G_UNICODE_UNASSIGNED:
+-	    /* Unassigned default ignorables */
+-	    if ((wc >= 0xFFF0 && wc <= 0xFFF8) ||
+-		(wc >= 0xE0000 && wc <= 0xE0FFF))
+-	      {
+-		GB_type = GB_ControlCRLF;
+-		break;
+-	      }
+-
+ 	  case G_UNICODE_OTHER_LETTER:
+ 	    if (makes_hangul_syllable)
+ 	      GB_type = GB_InHangulSyllable;
+@@ -446,67 +437,103 @@ pango_default_break (const gchar   *text
+ 	    GB_type = GB_Extend; /* Grapheme_Extend */
+ 	    break;
+ 
++	  case G_UNICODE_UNASSIGNED:
++	    /* Unassigned default ignorables */
++	    if ((wc >= 0xFFF0 && wc <= 0xFFF8) ||
++		(wc >= 0xE0000 && wc <= 0xE0FFF))
++	      {
++		GB_type = GB_ControlCRLF;
++		break;
++	      }
++
++	    /* In Unicode 9.0, some emoji characters are unassigned.
++	     * To support Unicode emoji 13.0, check the emoji characters here.
++	     */
+           case G_UNICODE_OTHER_SYMBOL:
+             if (G_UNLIKELY(wc == 0x261D ||
+-                           wc == 0x26F9 ||
+-                           (wc >= 0x270A && wc <= 0x270D) ||
+-                           wc == 0x1F385 ||
+-                           (wc >= 0x1F3C2 && wc <= 0x1F3C4) ||
+-                           wc == 0x1F3C7 ||
+-                           (wc >= 0x1F3CA && wc <= 0x1F3CC) ||
+-                           (wc >= 0x1F442 && wc <= 0x1F443) ||
+-                           (wc >= 0x1F446 && wc <= 0x1F450) ||
+-                           wc == 0x1F46E ||
+-                           (wc >= 0x1F470 && wc <= 0x1F478) ||
+-                           wc == 0x1F47C ||
+-                           (wc >= 0x1F481 && wc <= 0x1F483) ||
+-                           (wc >= 0x1F485 && wc <= 0x1F487) ||
+-                           wc == 0x1F4AA ||
+-                           (wc >= 0x1F574 && wc <= 0x1F575) ||
+-                           wc == 0x1F57A ||
+-                           wc == 0x1F590 ||
+-                           (wc >= 0x1F595 && wc <= 0x1F596) ||
+-                           (wc >= 0x1F645 && wc <= 0x1F647) ||
+-                           (wc >= 0x1F64B && wc <= 0x1F64F) ||
+-                           wc == 0x1F6A3 ||
+-                           (wc >= 0x1F6B4 && wc <= 0x1F6B6) ||
+-                           wc == 0x1F6C0 ||
+-                           wc == 0x1F6CC ||
+-                           (wc >= 0x1F918 && wc <= 0x1F91C) ||
+-                           (wc >= 0x1F91E && wc <= 0x1F91F) ||
+-                           wc == 0x1F926 ||
+-                           (wc >= 0x1F930 && wc <= 0x1F939) ||
+-                           (wc >= 0x1F93D && wc <= 0x1F93E) ||
+-                           (wc >= 0x1F9D1 && wc <= 0x1F9DD)))
++			   wc == 0x26F9 ||
++			   (wc >= 0x270A && wc <= 0x270D) ||
++			   wc == 0x1F385 ||
++			   (wc >= 0x1F3C2 && wc <= 0x1F3C4) ||
++			   wc == 0x1F3C7 ||
++			   (wc >= 0x1F3CA && wc <= 0x1F3CC) ||
++			   (wc >= 0x1F442 && wc <= 0x1F443) ||
++			   (wc >= 0x1F446 && wc <= 0x1F450) ||
++			   (wc >= 0x1F46A && wc <= 0x1F478) ||
++			   wc == 0x1F47C ||
++			   (wc >= 0x1F481 && wc <= 0x1F483) ||
++			   (wc >= 0x1F485 && wc <= 0x1F487) ||
++			   wc == 0x1F48F ||
++			   wc == 0x1F491 ||
++			   wc == 0x1F4AA ||
++			   (wc >= 0x1F574 && wc <= 0x1F575) ||
++			   wc == 0x1F57A ||
++			   wc == 0x1F590 ||
++			   (wc >= 0x1F595 && wc <= 0x1F596) ||
++			   (wc >= 0x1F645 && wc <= 0x1F647) ||
++			   (wc >= 0x1F64B && wc <= 0x1F64F) ||
++			   wc == 0x1F6A3 ||
++			   (wc >= 0x1F6B4 && wc <= 0x1F6B6) ||
++			   wc == 0x1F6C0 ||
++			   wc == 0x1F6CC ||
++			   wc == 0x1F90C ||
++			   wc == 0x1F90F ||
++			   (wc >= 0x1F918 && wc <= 0x1F91C) ||
++			   (wc >= 0x1F91E && wc <= 0x1F91F) ||
++			   wc == 0x1F926 ||
++			   (wc >= 0x1F930 && wc <= 0x1F939) ||
++			   (wc >= 0x1F93C && wc <= 0x1F93E) ||
++			   wc == 0x1F977 ||
++			   (wc >= 0x1F9B5 && wc <= 0x1F9B6) ||
++			   (wc >= 0x1F9B8 && wc <= 0x1F9B9) ||
++			   wc == 0x1F9BB ||
++			   (wc >= 0x1F9CD && wc <= 0x1F9CF) ||
++			   (wc >= 0x1F9D2 && wc <= 0x1F9DD)))
+               {
+                 GB_type = GB_E_Base;
+                 break;
+               }
+-            if (G_UNLIKELY(wc == 0x2640 ||
+-                           wc == 0x2642 ||
+-                           (wc >= 0x2695 && wc <= 0x2696) ||
+-                           wc == 0x2708 ||
+-                           wc == 0x2764 ||
+-                           wc == 0x1F308 ||
+-                           wc == 0x1F33E ||
+-                           wc == 0x1F373 ||
+-                           wc == 0x1F393 ||
+-                           wc == 0x1F3A4 ||
+-                           wc == 0x1F3A8 ||
+-                           wc == 0x1F3EB ||
+-                           wc == 0x1F3ED ||
+-                           wc == 0x1F48B ||
+-                           (wc >= 0x1F4BB && wc <= 0x1F4BC) ||
+-                           wc == 0x1F527 ||
+-                           wc == 0x1F52C ||
+-                           wc == 0x1F5E8 ||
+-                           wc == 0x1F680 ||
+-                           wc == 0x1F692))
++            if (G_UNLIKELY(wc == 0x2620 ||
++			   wc == 0x2640 ||
++			   wc == 0x2642 ||
++			   (wc >= 0x2695 && wc <= 0x2696) ||
++			   wc == 0x26A7 ||
++			   wc == 0x2708 ||
++			   wc == 0x2744 ||
++			   wc == 0x2764 ||
++			   wc == 0x2B1B ||
++			   wc == 0x1F308 ||
++			   wc == 0x1F32B ||
++			   wc == 0x1F33E ||
++			   wc == 0x1F373 ||
++			   wc == 0x1F37C ||
++			   wc == 0x1F384 ||
++			   wc == 0x1F393 ||
++			   wc == 0x1F3A4 ||
++			   wc == 0x1F3A8 ||
++			   wc == 0x1F3EB ||
++			   wc == 0x1F3ED ||
++			   wc == 0x1F48B ||
++			   wc == 0x1F4A8 ||
++			   wc == 0x1F4AB ||
++			   (wc >= 0x1F4BB && wc <= 0x1F4BC) ||
++			   wc == 0x1F525 ||
++			   wc == 0x1F527 ||
++			   wc == 0x1F52C ||
++			   wc == 0x1F5E8 ||
++			   wc == 0x1F680 ||
++			   wc == 0x1F692 ||
++			   (wc >= 0x1F9AF && wc <= 0x1F9B3) ||
++			   wc == 0x1F9BA ||
++			   (wc >= 0x1F9BC && wc <= 0x1F9BD) ||
++			   wc == 0x1FA79))
+               {
+                 GB_type = GB_Glue_After_Zwj;
+                 break;
+               }
+-            if (G_UNLIKELY(wc >= 0x1F466 && wc <= 0x1F469))
++            if (G_UNLIKELY((wc >= 0x1F466 && wc <= 0x1F469) ||
++			   wc == 0x1F91D ||
++			   wc == 0x1F9D1))
+               {
+                 GB_type = GB_E_Base_GAZ;
+                 break;
