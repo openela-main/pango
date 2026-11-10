@@ -9,13 +9,14 @@
 
 Name: pango
 Version: 1.48.7
-Release: 3%{?dist}
+Release: 4%{?dist}
 Summary: System for layout and rendering of internationalized text
 
 License: LGPLv2+
 URL: http://www.pango.org
 Source0: https://download.gnome.org/sources/%{name}/1.48/%{name}-%{version}.tar.xz
 Patch0: pango-update-emoji.patch
+Patch1: pango-use-cairo-user-font-el9.patch 
 
 BuildRequires: pkgconfig(cairo) >= %{cairo_version}
 BuildRequires: pkgconfig(freetype2) >= %{freetype_version}
@@ -127,6 +128,10 @@ fi
 
 
 %changelog
+* Tue May 12 2026 Sudip Shil <sshil@redhat.com> - 1.48.7-4
+- Fix PDF rendering of unknown glyphs
+- Resolves: RHEL-165080
+
 * Wed Nov  2 2022 Peng Wu <pwu@redhat.com> - 1.48.7-3
 - Update pango-emoji-table.h for emoji 14 support
 - Add pango-update-emoji.patch

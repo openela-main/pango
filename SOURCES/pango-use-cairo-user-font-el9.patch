@@ -1,0 +1,1082 @@
+From 5ae2689c3b59e77badcf9c0d1225510914480422 Mon Sep 17 00:00:00 2001
+From: Behdad Esfahbod <behdad@behdad.org>
+Date: Thu, 19 Mar 2026 14:29:46 -0600
+Subject: [PATCH 1/3] pangocairo: use a user font for unknown glyph hexboxes
+
+Unknown glyph hexboxes were drawn procedurally, so cairo PDF output
+ended up exposing the ASCII hex digits to text extractors instead of
+treating each fallback glyph as a single glyph.
+
+Fix this by rendering hexboxes through a cairo user font and by
+splitting cairo_show_text_glyphs() emission at cluster boundaries when
+switching between normal glyphs and unknown glyphs. This keeps normal
+text on the native scaled font while letting the PDF backend see each
+hexbox as one glyph.
+---
+ pango/pangocairo-font.c    | 479 ++++++++++++++++++++++++++++++++++++-
+ pango/pangocairo-private.h |   7 +
+ pango/pangocairo-render.c  | 323 ++++++++++++++++++++-----
+ 3 files changed, 752 insertions(+), 57 deletions(-)
+
+diff --git a/pango/pangocairo-font.c b/pango/pangocairo-font.c
+index 69c375c3..9e31bf0b 100644
+--- a/pango/pangocairo-font.c
++++ b/pango/pangocairo-font.c
+@@ -22,8 +22,6 @@
+ #include "config.h"
+ 
+ #include <math.h>
+-#include <string.h>
+-
+ #include "pangocairo.h"
+ #include "pangocairo-private.h"
+ #include "pango-font-private.h"
+@@ -38,6 +36,14 @@
+ typedef PangoCairoFontIface PangoCairoFontInterface;
+ G_DEFINE_INTERFACE (PangoCairoFont, pango_cairo_font, PANGO_TYPE_FONT)
+ 
++static PangoCairoFontHexBoxInfo *
++_pango_cairo_font_private_get_hex_box_info (PangoCairoFontPrivate *cf_priv);
++static void
++_pango_cairo_font_private_get_glyph_extents_missing (PangoCairoFontPrivate *cf_priv,
++						     PangoGlyph             glyph,
++						     PangoRectangle        *ink_rect,
++						     PangoRectangle        *logical_rect);
++
+ static void
+ pango_cairo_font_default_init (PangoCairoFontIface *iface)
+ {
+@@ -60,6 +66,379 @@ _pango_cairo_font_private_scaled_font_data_destroy (PangoCairoFontPrivateScaledF
+     }
+ }
+ 
++typedef struct
++{
++  PangoCairoFont *cfont;
++} PangoCairoHexBoxFontUserData;
++
++static const cairo_user_data_key_t pango_cairo_hex_box_font_private_key = {0};
++
++static void
++pango_cairo_hex_box_font_user_data_destroy (void *data)
++{
++  PangoCairoHexBoxFontUserData *user_data = data;
++
++  g_clear_object (&user_data->cfont);
++  g_free (user_data);
++}
++
++static PangoCairoFontPrivate *
++pango_cairo_hex_box_get_font_private (cairo_scaled_font_t *scaled_font)
++{
++  cairo_font_face_t *font_face = cairo_scaled_font_get_font_face (scaled_font);
++  PangoCairoHexBoxFontUserData *user_data;
++
++  user_data = cairo_font_face_get_user_data (font_face,
++                                             &pango_cairo_hex_box_font_private_key);
++  if (!user_data)
++    return NULL;
++
++  return PANGO_CAIRO_FONT_PRIVATE (user_data->cfont);
++}
++
++static unsigned long
++pango_cairo_hex_box_encode_glyph (PangoCairoFontPrivate *cf_priv,
++                                  PangoGlyph             glyph)
++{
++  gpointer value;
++
++  if (!(glyph & PANGO_GLYPH_UNKNOWN_FLAG))
++    return glyph;
++
++  if (!cf_priv->hex_box_glyphs)
++    {
++      cf_priv->hex_box_glyph_base = 1;
++      cf_priv->hex_box_glyphs = g_hash_table_new (g_direct_hash, g_direct_equal);
++      cf_priv->hex_box_pango_glyphs = g_array_new (FALSE, FALSE, sizeof (PangoGlyph));
++    }
++
++  value = g_hash_table_lookup (cf_priv->hex_box_glyphs, GUINT_TO_POINTER (glyph));
++  if (value)
++    return GPOINTER_TO_UINT (value);
++
++  if (cf_priv->hex_box_glyph_base + cf_priv->hex_box_pango_glyphs->len > 0xFFFF)
++    return glyph;
++
++  value = GUINT_TO_POINTER (cf_priv->hex_box_glyph_base + cf_priv->hex_box_pango_glyphs->len);
++  g_hash_table_insert (cf_priv->hex_box_glyphs,
++                       GUINT_TO_POINTER (glyph),
++                       value);
++  g_array_append_val (cf_priv->hex_box_pango_glyphs, glyph);
++
++  return GPOINTER_TO_UINT (value);
++}
++
++static PangoGlyph
++pango_cairo_hex_box_decode_glyph (PangoCairoFontPrivate *cf_priv,
++                                  unsigned long          glyph)
++{
++  if (cf_priv->hex_box_pango_glyphs &&
++      glyph >= cf_priv->hex_box_glyph_base &&
++      glyph < cf_priv->hex_box_glyph_base + cf_priv->hex_box_pango_glyphs->len)
++    return g_array_index (cf_priv->hex_box_pango_glyphs,
++                          PangoGlyph,
++                          glyph - cf_priv->hex_box_glyph_base);
++
++  return glyph;
++}
++
++static void
++pango_cairo_hex_box_draw_frame (cairo_t  *cr,
++                                double    x,
++                                double    y,
++                                double    width,
++                                double    height,
++                                double    line_width,
++                                gboolean  invalid)
++{
++  cairo_rectangle (cr, x, y, width, height);
++
++  if (invalid)
++    {
++      cairo_new_sub_path (cr);
++      cairo_move_to (cr, x, y);
++      cairo_rel_line_to (cr, width, height);
++
++      cairo_new_sub_path (cr);
++      cairo_move_to (cr, x + width, y);
++      cairo_rel_line_to (cr, -width, height);
++
++      cairo_set_line_cap (cr, CAIRO_LINE_CAP_BUTT);
++    }
++
++  cairo_set_line_width (cr, line_width);
++  cairo_set_line_join (cr, CAIRO_LINE_JOIN_MITER);
++  cairo_set_miter_limit (cr, 2.);
++  cairo_stroke (cr);
++}
++
++static void
++pango_cairo_hex_box_draw_box_glyph (cairo_t  *cr,
++                                    double    width,
++                                    gboolean  invalid)
++{
++  pango_cairo_hex_box_draw_frame (cr,
++                                  1.5,
++                                  1.5 - PANGO_UNKNOWN_GLYPH_HEIGHT,
++                                  width - 3.0,
++                                  PANGO_UNKNOWN_GLYPH_HEIGHT - 3.0,
++                                  1.0,
++                                  invalid);
++}
++
++static void
++pango_cairo_hex_box_render_missing_glyph (PangoCairoFontPrivate *cf_priv,
++                                          PangoGlyph             glyph,
++                                          cairo_t               *cr)
++{
++  char buf[7];
++  char hexbox_string[2] = { 0, 0 };
++  PangoCairoFontHexBoxInfo *hbi;
++  PangoRectangle logical_rect;
++  const char *name;
++  const char *p;
++  gunichar ch;
++  gboolean invalid_input;
++  double width, lsb, x0, y0;
++  int row, col;
++  int rows, cols;
++
++  ch = glyph & ~PANGO_GLYPH_UNKNOWN_FLAG;
++  invalid_input = G_UNLIKELY (glyph == PANGO_GLYPH_INVALID_INPUT || ch > 0x10FFFF);
++
++  _pango_cairo_font_private_get_glyph_extents_missing (cf_priv, glyph, NULL, &logical_rect);
++  width = (double) logical_rect.width / PANGO_SCALE;
++
++  hbi = _pango_cairo_font_private_get_hex_box_info (cf_priv);
++  if (!hbi || !_pango_cairo_font_install ((PangoFont *) hbi->font, cr))
++    {
++      pango_cairo_hex_box_draw_box_glyph (cr, width, invalid_input);
++      return;
++    }
++
++  if (G_UNLIKELY (invalid_input))
++    {
++      rows = hbi->rows;
++      cols = 1;
++    }
++  else if (ch == 0x2423 || g_unichar_type (ch) == G_UNICODE_SPACE_SEPARATOR)
++    {
++      double x = 0.5 * width;
++      double y = hbi->box_descent - 0.5 * hbi->box_height;
++
++      cairo_new_sub_path (cr);
++      cairo_arc (cr, x, y, 1.5 * hbi->line_width, 0, 2 * G_PI);
++      cairo_close_path (cr);
++      cairo_fill (cr);
++      return;
++    }
++  else if (ch == '\t')
++    {
++      double y = hbi->box_descent - 0.5 * hbi->box_height;
++      double offset = 0.2 * width;
++      double x = offset;
++      double al = width - 2 * offset;
++      double tl = MIN (hbi->digit_width, 0.75 * al);
++      double tw2 = 2.5 * hbi->line_width;
++      double lw2 = 0.5 * hbi->line_width;
++
++      cairo_move_to (cr, x - lw2, y - tw2);
++      cairo_line_to (cr, x + lw2, y - tw2);
++      cairo_line_to (cr, x + lw2, y - lw2);
++      cairo_line_to (cr, x + al - tl, y - lw2);
++      cairo_line_to (cr, x + al - tl, y - tw2);
++      cairo_line_to (cr, x + al,  y);
++      cairo_line_to (cr, x + al - tl, y + tw2);
++      cairo_line_to (cr, x + al - tl, y + lw2);
++      cairo_line_to (cr, x + lw2, y + lw2);
++      cairo_line_to (cr, x + lw2, y + tw2);
++      cairo_line_to (cr, x - lw2, y + tw2);
++      cairo_close_path (cr);
++      cairo_fill (cr);
++      return;
++    }
++  else if (ch == '\n' || ch == 0x2028 || ch == 0x2029)
++    {
++      double offset = 0.2 * width;
++      double al = width - 2 * offset;
++      double tl = MIN (hbi->digit_width, 0.75 * al);
++      double ah = al - 0.5 * tl;
++      double tw2 = 2.5 * hbi->line_width;
++      double x = offset;
++      double y = - (hbi->box_height - al) / 2;
++      double lw2 = 0.5 * hbi->line_width;
++
++      cairo_move_to (cr, x, y);
++      cairo_line_to (cr, x + tl, y - tw2);
++      cairo_line_to (cr, x + tl, y - lw2);
++      cairo_line_to (cr, x + al - lw2, y - lw2);
++      cairo_line_to (cr, x + al - lw2, y - ah);
++      cairo_line_to (cr, x + al + lw2, y - ah);
++      cairo_line_to (cr, x + al + lw2, y + lw2);
++      cairo_line_to (cr, x + tl, y + lw2);
++      cairo_line_to (cr, x + tl, y + tw2);
++      cairo_close_path (cr);
++      cairo_fill (cr);
++      return;
++    }
++  else if ((name = pango_get_ignorable_size (ch, &rows, &cols)))
++    {
++      /* Nothing else to do, we render default-ignorables with their nick. */
++    }
++  else
++    {
++      rows = hbi->rows;
++      cols = (ch > 0xffff ? 6 : 4) / rows;
++      g_snprintf (buf, sizeof (buf), (ch > 0xffff) ? "%06X" : "%04X", ch);
++      name = buf;
++    }
++
++  width = 3 * hbi->pad_x + cols * (hbi->digit_width + hbi->pad_x);
++  lsb = ((double) logical_rect.width / PANGO_SCALE - width) * .5;
++  lsb = floor (lsb / hbi->pad_x) * hbi->pad_x;
++
++  pango_cairo_hex_box_draw_frame (cr,
++                                  lsb + 1.5 * hbi->pad_x,
++                                  hbi->box_descent - hbi->box_height + hbi->pad_y * .5,
++                                  width - hbi->pad_x,
++                                  hbi->box_height - hbi->pad_y,
++                                  hbi->line_width,
++                                  invalid_input);
++
++  if (invalid_input)
++    return;
++
++  x0 = lsb + hbi->pad_x * 3;
++  y0 = hbi->box_descent - hbi->pad_y * 2 - ((hbi->rows - rows) * hbi->digit_height / 2);
++
++  for (row = 0, p = name; row < rows; row++)
++    {
++      double y = y0 - (rows - 1 - row) * (hbi->digit_height + hbi->pad_y);
++
++      for (col = 0; col < cols; col++, p++)
++        {
++          double x = x0 + col * (hbi->digit_width + hbi->pad_x);
++
++          cairo_move_to (cr, x, y);
++          hexbox_string[0] = p[0];
++          cairo_text_path (cr, hexbox_string);
++          cairo_fill (cr);
++        }
++    }
++}
++
++static void
++pango_cairo_hex_box_font_space_advance (cairo_t *cr,
++                                        double  *x_advance,
++                                        double  *y_advance)
++{
++  cairo_matrix_t matrix;
++
++  cairo_get_matrix (cr, &matrix);
++  if (cairo_matrix_invert (&matrix) == CAIRO_STATUS_SUCCESS)
++    cairo_matrix_transform_distance (&matrix, x_advance, y_advance);
++}
++
++static cairo_status_t
++pango_cairo_hex_box_render_glyph (cairo_scaled_font_t  *scaled_font,
++                                  unsigned long         glyph,
++                                  cairo_t              *cr,
++                                  cairo_text_extents_t *extents)
++{
++  PangoCairoFontPrivate *cf_priv = pango_cairo_hex_box_get_font_private (scaled_font);
++  cairo_scaled_font_t *native_scaled_font;
++  PangoGlyph pango_glyph;
++  PangoRectangle logical_rect;
++  double x_advance = 0;
++  double y_advance = 0;
++
++  if (!cf_priv)
++    return CAIRO_STATUS_USER_FONT_ERROR;
++
++  pango_glyph = pango_cairo_hex_box_decode_glyph (cf_priv, glyph);
++
++  if (pango_glyph & PANGO_GLYPH_UNKNOWN_FLAG)
++    {
++      _pango_cairo_font_private_get_glyph_extents_missing (cf_priv,
++                                                           pango_glyph,
++                                                           NULL,
++                                                           &logical_rect);
++      x_advance = (double) logical_rect.width / PANGO_SCALE;
++    }
++  else
++    {
++      cairo_glyph_t cairo_glyph = { pango_glyph, 0, 0 };
++
++      native_scaled_font = _pango_cairo_font_private_get_scaled_font (cf_priv);
++      if (!native_scaled_font || cairo_scaled_font_status (native_scaled_font) != CAIRO_STATUS_SUCCESS)
++        return CAIRO_STATUS_USER_FONT_ERROR;
++
++      cairo_scaled_font_glyph_extents (native_scaled_font, &cairo_glyph, 1, extents);
++      x_advance = extents->x_advance;
++      y_advance = extents->y_advance;
++    }
++
++  pango_cairo_hex_box_font_space_advance (cr, &x_advance, &y_advance);
++  extents->x_bearing = 0;
++  extents->y_bearing = 0;
++  extents->width = 0;
++  extents->height = 0;
++  extents->x_advance = x_advance;
++  extents->y_advance = y_advance;
++
++  cairo_save (cr);
++  cairo_identity_matrix (cr);
++  {
++    if (pango_glyph & PANGO_GLYPH_UNKNOWN_FLAG)
++      {
++        pango_cairo_hex_box_render_missing_glyph (cf_priv, pango_glyph, cr);
++      }
++    else
++      {
++        cairo_glyph_t cairo_glyph = { pango_glyph, 0, 0 };
++
++        cairo_set_scaled_font (cr, native_scaled_font);
++        cairo_glyph_path (cr, &cairo_glyph, 1);
++        cairo_fill (cr);
++      }
++  }
++  cairo_restore (cr);
++
++  return CAIRO_STATUS_SUCCESS;
++}
++
++static cairo_status_t
++pango_cairo_hex_box_unicode_to_glyph (cairo_scaled_font_t *scaled_font,
++                                      unsigned long        unicode,
++                                      unsigned long       *glyph_index)
++{
++  PangoCairoFontPrivate *cf_priv = pango_cairo_hex_box_get_font_private (scaled_font);
++  hb_font_t *hb_font;
++  hb_codepoint_t glyph;
++
++  if (!cf_priv)
++    return CAIRO_STATUS_USER_FONT_ERROR;
++
++  hb_font = pango_font_get_hb_font (PANGO_FONT (cf_priv->cfont));
++  if (hb_font_get_nominal_glyph (hb_font, unicode, &glyph))
++    {
++      *glyph_index = glyph;
++      return CAIRO_STATUS_SUCCESS;
++    }
++
++  if (unicode == 0x20)
++    {
++      *glyph_index = pango_cairo_hex_box_encode_glyph (cf_priv,
++                                                       PANGO_GET_UNKNOWN_GLYPH (0x20));
++      return CAIRO_STATUS_SUCCESS;
++    }
++
++  *glyph_index = pango_cairo_hex_box_encode_glyph (cf_priv,
++                                                   unicode > 0x10FFFF ? PANGO_GLYPH_INVALID_INPUT
++                                                                      : PANGO_GET_UNKNOWN_GLYPH (unicode));
++  return CAIRO_STATUS_SUCCESS;
++}
++
+ cairo_scaled_font_t *
+ _pango_cairo_font_private_get_scaled_font (PangoCairoFontPrivate *cf_priv)
+ {
+@@ -135,6 +514,85 @@ done:
+   return cf_priv->scaled_font;
+ }
+ 
++cairo_scaled_font_t *
++_pango_cairo_font_get_hex_box_scaled_font (PangoCairoFont *cfont)
++{
++  PangoCairoFontPrivate *cf_priv = PANGO_CAIRO_FONT_PRIVATE (cfont);
++  cairo_scaled_font_t *native_scaled_font;
++  cairo_font_face_t *font_face;
++  cairo_font_options_t *font_options;
++  cairo_matrix_t ctm, font_matrix;
++  PangoCairoHexBoxFontUserData *user_data;
++
++  if (G_UNLIKELY (!cf_priv))
++    return NULL;
++
++  if (cf_priv->hex_box_scaled_font)
++    return cf_priv->hex_box_scaled_font;
++
++  native_scaled_font = _pango_cairo_font_private_get_scaled_font (cf_priv);
++  if (G_UNLIKELY (!native_scaled_font || cairo_scaled_font_status (native_scaled_font) != CAIRO_STATUS_SUCCESS))
++    return NULL;
++
++  font_face = cairo_user_font_face_create ();
++  if (G_UNLIKELY (cairo_font_face_status (font_face) != CAIRO_STATUS_SUCCESS))
++    {
++      cairo_font_face_destroy (font_face);
++      return NULL;
++    }
++
++  cairo_user_font_face_set_render_glyph_func (font_face, pango_cairo_hex_box_render_glyph);
++  cairo_user_font_face_set_unicode_to_glyph_func (font_face, pango_cairo_hex_box_unicode_to_glyph);
++  user_data = g_new0 (PangoCairoHexBoxFontUserData, 1);
++  user_data->cfont = g_object_ref (cfont);
++  if (G_UNLIKELY (cairo_font_face_set_user_data (font_face,
++                                                 &pango_cairo_hex_box_font_private_key,
++                                                 user_data,
++                                                 pango_cairo_hex_box_font_user_data_destroy) != CAIRO_STATUS_SUCCESS))
++    {
++      pango_cairo_hex_box_font_user_data_destroy (user_data);
++      cairo_font_face_destroy (font_face);
++      return NULL;
++    }
++
++  cairo_scaled_font_get_ctm (native_scaled_font, &ctm);
++  cairo_scaled_font_get_font_matrix (native_scaled_font, &font_matrix);
++  font_options = cairo_font_options_create ();
++  cairo_scaled_font_get_font_options (native_scaled_font, font_options);
++
++  cf_priv->hex_box_scaled_font = cairo_scaled_font_create (font_face,
++                                                           &font_matrix,
++                                                           &ctm,
++                                                           font_options);
++
++  cairo_font_options_destroy (font_options);
++  cairo_font_face_destroy (font_face);
++
++  if (G_UNLIKELY (!cf_priv->hex_box_scaled_font ||
++                  cairo_scaled_font_status (cf_priv->hex_box_scaled_font) != CAIRO_STATUS_SUCCESS))
++    {
++      cairo_scaled_font_t *scaled_font = cf_priv->hex_box_scaled_font;
++
++      cf_priv->hex_box_scaled_font = NULL;
++      if (scaled_font)
++        cairo_scaled_font_destroy (scaled_font);
++    }
++
++  return cf_priv->hex_box_scaled_font;
++}
++
++unsigned long
++_pango_cairo_font_encode_hex_box_glyph (PangoCairoFont *cfont,
++                                        PangoGlyph      glyph)
++{
++  PangoCairoFontPrivate *cf_priv = PANGO_CAIRO_FONT_PRIVATE (cfont);
++
++  if (G_UNLIKELY (!cf_priv))
++    return glyph;
++
++  return pango_cairo_hex_box_encode_glyph (cf_priv, glyph);
++}
++
+ /**
+  * pango_cairo_font_get_scaled_font:
+  * @font: (nullable): a `PangoFont` from a `PangoCairoFontMap`
+@@ -632,7 +1090,11 @@ _pango_cairo_font_private_initialize (PangoCairoFontPrivate      *cf_priv,
+   cf_priv->is_hinted = cairo_font_options_get_hint_metrics (font_options) != CAIRO_HINT_METRICS_OFF;
+ 
+   cf_priv->scaled_font = NULL;
++  cf_priv->hex_box_scaled_font = NULL;
+   cf_priv->hbi = NULL;
++  cf_priv->hex_box_glyphs = NULL;
++  cf_priv->hex_box_pango_glyphs = NULL;
++  cf_priv->hex_box_glyph_base = 0;
+   cf_priv->glyph_extents_cache = NULL;
+   cf_priv->metrics_by_lang = NULL;
+ }
+@@ -653,9 +1115,22 @@ _pango_cairo_font_private_finalize (PangoCairoFontPrivate *cf_priv)
+     cairo_scaled_font_destroy (cf_priv->scaled_font);
+   cf_priv->scaled_font = NULL;
+ 
++  if (cf_priv->hex_box_scaled_font)
++    cairo_scaled_font_destroy (cf_priv->hex_box_scaled_font);
++  cf_priv->hex_box_scaled_font = NULL;
++
+   _pango_cairo_font_hex_box_info_destroy (cf_priv->hbi);
+   cf_priv->hbi = NULL;
+ 
++  if (cf_priv->hex_box_glyphs)
++    g_hash_table_destroy (cf_priv->hex_box_glyphs);
++  cf_priv->hex_box_glyphs = NULL;
++
++  if (cf_priv->hex_box_pango_glyphs)
++    g_array_free (cf_priv->hex_box_pango_glyphs, TRUE);
++  cf_priv->hex_box_pango_glyphs = NULL;
++  cf_priv->hex_box_glyph_base = 0;
++
+   if (cf_priv->glyph_extents_cache)
+     g_free (cf_priv->glyph_extents_cache);
+   cf_priv->glyph_extents_cache = NULL;
+diff --git a/pango/pangocairo-private.h b/pango/pangocairo-private.h
+index 704ae497..272fab12 100644
+--- a/pango/pangocairo-private.h
++++ b/pango/pangocairo-private.h
+@@ -79,7 +79,11 @@ struct _PangoCairoFontPrivate
+   PangoCairoFontPrivateScaledFontData *data;
+ 
+   cairo_scaled_font_t *scaled_font;
++  cairo_scaled_font_t *hex_box_scaled_font;
+   PangoCairoFontHexBoxInfo *hbi;
++  GHashTable *hex_box_glyphs;
++  GArray *hex_box_pango_glyphs;
++  unsigned int hex_box_glyph_base;
+ 
+   gboolean is_hinted;
+   PangoGravity gravity;
+@@ -103,6 +107,9 @@ struct _PangoCairoFontIface
+ 
+ gboolean _pango_cairo_font_install (PangoFont *font,
+ 				    cairo_t   *cr);
++cairo_scaled_font_t *_pango_cairo_font_get_hex_box_scaled_font (PangoCairoFont *cfont);
++unsigned long _pango_cairo_font_encode_hex_box_glyph (PangoCairoFont *cfont,
++						      PangoGlyph      glyph);
+ PangoFontMetrics * _pango_cairo_font_get_metrics (PangoFont     *font,
+ 						  PangoLanguage *language);
+ PangoCairoFontHexBoxInfo *_pango_cairo_font_get_hex_box_info (PangoCairoFont *cfont);
+diff --git a/pango/pangocairo-render.c b/pango/pangocairo-render.c
+index 2c552ba1..5133ffe8 100644
+--- a/pango/pangocairo-render.c
++++ b/pango/pangocairo-render.c
+@@ -395,6 +395,92 @@ done:
+   cairo_restore (crenderer->cr);
+ }
+ 
++static gboolean
++pango_cairo_glyph_string_has_unknown_glyphs (PangoGlyphString *glyphs)
++{
++  int i;
++
++  for (i = 0; i < glyphs->num_glyphs; i++)
++    {
++      if (glyphs->glyphs[i].glyph & PANGO_GLYPH_UNKNOWN_FLAG)
++        return TRUE;
++    }
++
++  return FALSE;
++}
++
++static gboolean
++pango_cairo_glyph_range_has_unknown_glyphs (PangoGlyphString *glyphs,
++                                            int               glyph_start,
++                                            int               glyph_end)
++{
++  int i;
++  int dir = glyph_start < glyph_end ? 1 : -1;
++
++  for (i = glyph_start; i != glyph_end; i += dir)
++    {
++      if (glyphs->glyphs[i].glyph & PANGO_GLYPH_UNKNOWN_FLAG)
++        return TRUE;
++    }
++
++  return FALSE;
++}
++
++static int
++pango_cairo_renderer_count_glyphs (PangoGlyphString *glyphs,
++                                   int               glyph_start,
++                                   int               glyph_end,
++                                   gboolean          use_hex_box_scaled_font)
++{
++  int count = 0;
++  int i;
++  int dir = glyph_start < glyph_end ? 1 : -1;
++
++  for (i = glyph_start; i != glyph_end; i += dir)
++    {
++      PangoGlyph glyph = glyphs->glyphs[i].glyph;
++
++      if (glyph == PANGO_GLYPH_EMPTY)
++        continue;
++
++      if (!use_hex_box_scaled_font && (glyph & PANGO_GLYPH_UNKNOWN_FLAG))
++        continue;
++
++      count++;
++    }
++
++  return count;
++}
++
++static void
++pango_cairo_renderer_get_glyph_range (int  glyph_start,
++                                      int  glyph_end,
++                                      int *range_start,
++                                      int *range_end)
++{
++  if (glyph_start < glyph_end)
++    {
++      *range_start = glyph_start;
++      *range_end = glyph_end;
++    }
++  else
++    {
++      *range_start = glyph_end + 1;
++      *range_end = glyph_start + 1;
++    }
++}
++
++static gboolean
++pango_cairo_renderer_has_hex_box_scaled_font (PangoCairoRenderer *crenderer,
++                                              PangoFont          *font,
++                                              PangoGlyphString   *glyphs)
++{
++  return !crenderer->do_path &&
++         crenderer->has_show_text_glyphs &&
++         pango_cairo_glyph_string_has_unknown_glyphs (glyphs) &&
++         _pango_cairo_font_get_hex_box_scaled_font ((PangoCairoFont *) font) != NULL;
++}
++
+ #ifndef STACK_BUFFER_SIZE
+ #define STACK_BUFFER_SIZE (512 * sizeof (int))
+ #endif
+@@ -402,16 +488,19 @@ done:
+ #define STACK_ARRAY_LENGTH(T) (STACK_BUFFER_SIZE / sizeof(T))
+ 
+ static void
+-pango_cairo_renderer_show_text_glyphs (PangoRenderer        *renderer,
+-				       const char           *text,
+-				       int                   text_len,
+-				       PangoGlyphString     *glyphs,
+-				       cairo_text_cluster_t *clusters,
+-				       int                   num_clusters,
+-				       gboolean              backward,
+-				       PangoFont            *font,
+-				       int                   x,
+-				       int                   y)
++pango_cairo_renderer_show_text_glyphs_range (PangoRenderer        *renderer,
++					     const char           *text,
++					     int                   text_len,
++					     PangoGlyphString     *glyphs,
++					     int                   glyph_start,
++					     int                   glyph_end,
++					     cairo_text_cluster_t *clusters,
++					     int                   num_clusters,
++					     gboolean              backward,
++					     PangoFont            *font,
++					     int                   x,
++					     int                   y,
++					     gboolean              use_hex_box_scaled_font)
+ {
+   PangoCairoRenderer *crenderer = (PangoCairoRenderer *) (renderer);
+ 
+@@ -426,9 +515,15 @@ pango_cairo_renderer_show_text_glyphs (PangoRenderer        *renderer,
+   if (!crenderer->do_path)
+     set_color (crenderer, PANGO_RENDER_PART_FOREGROUND);
+ 
+-  if (!_pango_cairo_font_install (font, crenderer->cr))
++  for (i = 0; i < glyph_start; i++)
++    x_position += glyphs->glyphs[i].geometry.width;
++
++  if (use_hex_box_scaled_font)
++    cairo_set_scaled_font (crenderer->cr,
++                           _pango_cairo_font_get_hex_box_scaled_font ((PangoCairoFont *) font));
++  else if (!_pango_cairo_font_install (font, crenderer->cr))
+     {
+-      for (i = 0; i < glyphs->num_glyphs; i++)
++      for (i = glyph_start; i < glyph_end; i++)
+ 	{
+ 	  PangoGlyphInfo *gi = &glyphs->glyphs[i];
+ 
+@@ -447,13 +542,13 @@ pango_cairo_renderer_show_text_glyphs (PangoRenderer        *renderer,
+       goto done;
+     }
+ 
+-  if (glyphs->num_glyphs > (int) G_N_ELEMENTS (stack_glyphs))
+-    cairo_glyphs = g_new (cairo_glyph_t, glyphs->num_glyphs);
++  if (glyph_end - glyph_start > (int) G_N_ELEMENTS (stack_glyphs))
++    cairo_glyphs = g_new (cairo_glyph_t, glyph_end - glyph_start);
+   else
+     cairo_glyphs = stack_glyphs;
+ 
+   count = 0;
+-  for (i = 0; i < glyphs->num_glyphs; i++)
++  for (i = glyph_start; i < glyph_end; i++)
+     {
+       PangoGlyphInfo *gi = &glyphs->glyphs[i];
+ 
+@@ -466,10 +561,18 @@ pango_cairo_renderer_show_text_glyphs (PangoRenderer        *renderer,
+ 
+ 	  if (gi->glyph & PANGO_GLYPH_UNKNOWN_FLAG)
+             {
+-              if (gi->glyph == (0x20 | PANGO_GLYPH_UNKNOWN_FLAG))
++              if (use_hex_box_scaled_font)
++                {
++                  cairo_glyphs[count].index = _pango_cairo_font_encode_hex_box_glyph ((PangoCairoFont *) font,
++                                                                                       gi->glyph);
++                  cairo_glyphs[count].x = cx;
++                  cairo_glyphs[count].y = cy;
++                  count++;
++                }
++              else if (gi->glyph == (0x20 | PANGO_GLYPH_UNKNOWN_FLAG))
+                 ; /* no hex boxes for space, please */
+               else
+-	        _pango_cairo_renderer_draw_unknown_glyph (crenderer, font, gi, cx, cy);
++		        _pango_cairo_renderer_draw_unknown_glyph (crenderer, font, gi, cx, cy);
+             }
+ 	  else
+ 	    {
+@@ -501,6 +604,69 @@ done:
+   cairo_restore (crenderer->cr);
+ }
+ 
++static void
++pango_cairo_renderer_show_text_glyphs (PangoRenderer        *renderer,
++				       const char           *text,
++				       int                   text_len,
++				       PangoGlyphString     *glyphs,
++				       cairo_text_cluster_t *clusters,
++				       int                   num_clusters,
++				       gboolean              backward,
++				       PangoFont            *font,
++				       int                   x,
++				       int                   y)
++{
++  pango_cairo_renderer_show_text_glyphs_range (renderer,
++					       text,
++					       text_len,
++					       glyphs,
++					       0,
++					       glyphs->num_glyphs,
++					       clusters,
++					       num_clusters,
++					       backward,
++					       font,
++					       x,
++					       y,
++					       FALSE);
++}
++
++static void
++pango_cairo_renderer_show_text_glyphs_segment (PangoRenderer        *renderer,
++					       const char           *text,
++					       PangoGlyphString     *glyphs,
++					       int                   text_start,
++					       int                   text_end,
++					       int                   glyph_start,
++					       int                   glyph_end,
++					       cairo_text_cluster_t *clusters,
++					       int                   num_clusters,
++					       gboolean              backward,
++					       PangoFont            *font,
++					       int                   x,
++					       int                   y,
++					       gboolean              use_hex_box_scaled_font)
++{
++  int range_start, range_end;
++
++  pango_cairo_renderer_get_glyph_range (glyph_start, glyph_end,
++					&range_start, &range_end);
++
++  pango_cairo_renderer_show_text_glyphs_range (renderer,
++					       text + text_start,
++					       text_end - text_start,
++					       glyphs,
++					       range_start,
++					       range_end,
++					       clusters,
++					       num_clusters,
++					       backward,
++					       font,
++					       x,
++					       y,
++					       use_hex_box_scaled_font);
++}
++
+ static void
+ pango_cairo_renderer_draw_glyphs (PangoRenderer     *renderer,
+ 				  PangoFont         *font,
+@@ -533,6 +699,7 @@ pango_cairo_renderer_draw_glyph_item (PangoRenderer     *renderer,
+   PangoGlyphItemIter   iter;
+   cairo_text_cluster_t *cairo_clusters;
+   cairo_text_cluster_t stack_clusters[STACK_ARRAY_LENGTH (cairo_text_cluster_t)];
++  gboolean              use_hex_box_scaled_font;
+   int num_clusters;
+ 
+   if (!crenderer->has_show_text_glyphs || crenderer->do_path)
+@@ -547,50 +714,96 @@ pango_cairo_renderer_draw_glyph_item (PangoRenderer     *renderer,
+       return;
+     }
+ 
++  use_hex_box_scaled_font = pango_cairo_renderer_has_hex_box_scaled_font (crenderer,
++									  font,
++									  glyphs);
++
+   if (glyphs->num_glyphs > (int) G_N_ELEMENTS (stack_clusters))
+     cairo_clusters = g_new (cairo_text_cluster_t, glyphs->num_glyphs);
+   else
+     cairo_clusters = stack_clusters;
+ 
+-  num_clusters = 0;
+-  if (pango_glyph_item_iter_init_start (&iter, glyph_item, text))
+-    {
+-      do {
+-        int num_bytes, num_glyphs, i;
+-
+-        num_bytes  = iter.end_index - iter.start_index;
+-        num_glyphs = backward ? iter.start_glyph - iter.end_glyph : iter.end_glyph - iter.start_glyph;
+-
+-	if (num_bytes < 1)
+-	  g_warning ("pango_cairo_renderer_draw_glyph_item: bad cluster has num_bytes %d", num_bytes);
+-	if (num_glyphs < 1)
+-	  g_warning ("pango_cairo_renderer_draw_glyph_item: bad cluster has num_glyphs %d", num_glyphs);
+-
+-	/* Discount empty and unknown glyphs */
+-	for (i = MIN (iter.start_glyph, iter.end_glyph+1);
+-	     i < MAX (iter.start_glyph+1, iter.end_glyph);
+-	     i++)
+-	  {
+-	    PangoGlyphInfo *gi = &glyphs->glyphs[i];
+-
+-	    if (gi->glyph == PANGO_GLYPH_EMPTY ||
+-		gi->glyph & PANGO_GLYPH_UNKNOWN_FLAG)
+-	      num_glyphs--;
+-	  }
+-
+-        cairo_clusters[num_clusters].num_bytes  = num_bytes;
+-        cairo_clusters[num_clusters].num_glyphs = num_glyphs;
+-        num_clusters++;
+-      } while (pango_glyph_item_iter_next_cluster (&iter));
+-    }
++  {
++    gboolean have_segment = FALSE;
++    gboolean segment_use_hex_box = FALSE;
++    int segment_start_index = 0;
++    int segment_end_index = 0;
++    int segment_start_glyph = 0;
++    int segment_end_glyph = 0;
++
++    num_clusters = 0;
++    if (pango_glyph_item_iter_init_start (&iter, glyph_item, text))
++      {
++	do {
++	  gboolean cluster_use_hex_box;
++	  int num_bytes, num_glyphs;
++
++	  num_bytes = iter.end_index - iter.start_index;
++	  cluster_use_hex_box = use_hex_box_scaled_font &&
++				pango_cairo_glyph_range_has_unknown_glyphs (glyphs,
++									    iter.start_glyph,
++									    iter.end_glyph);
++	  num_glyphs = pango_cairo_renderer_count_glyphs (glyphs,
++							   iter.start_glyph,
++							   iter.end_glyph,
++							   cluster_use_hex_box);
++
++	  if (num_bytes < 1)
++	    g_warning ("pango_cairo_renderer_draw_glyph_item: bad cluster has num_bytes %d", num_bytes);
++	  if (backward ? iter.start_glyph - iter.end_glyph < 1 : iter.end_glyph - iter.start_glyph < 1)
++	    g_warning ("pango_cairo_renderer_draw_glyph_item: bad cluster has num_glyphs %d",
++		       backward ? iter.start_glyph - iter.end_glyph : iter.end_glyph - iter.start_glyph);
++
++	  if (have_segment && cluster_use_hex_box != segment_use_hex_box)
++	    {
++	      pango_cairo_renderer_show_text_glyphs_segment (renderer,
++							     text,
++							     glyphs,
++							     segment_start_index,
++							     segment_end_index,
++							     segment_start_glyph,
++							     segment_end_glyph,
++							     cairo_clusters,
++							     num_clusters,
++							     backward,
++							     font,
++							     x, y,
++							     segment_use_hex_box);
++	      have_segment = FALSE;
++	      num_clusters = 0;
++	    }
+ 
+-  pango_cairo_renderer_show_text_glyphs (renderer,
+-					 text + item->offset, item->length,
+-					 glyphs,
+-					 cairo_clusters, num_clusters,
+-					 backward,
+-					 font,
+-					 x, y);
++	  if (!have_segment)
++	    {
++	      segment_use_hex_box = cluster_use_hex_box;
++	      segment_start_index = iter.start_index;
++	      segment_start_glyph = iter.start_glyph;
++	      have_segment = TRUE;
++	    }
++
++	  segment_end_index = iter.end_index;
++	  segment_end_glyph = iter.end_glyph;
++	  cairo_clusters[num_clusters].num_bytes = num_bytes;
++	  cairo_clusters[num_clusters].num_glyphs = num_glyphs;
++	  num_clusters++;
++	} while (pango_glyph_item_iter_next_cluster (&iter));
++      }
++
++    if (have_segment)
++      pango_cairo_renderer_show_text_glyphs_segment (renderer,
++						     text,
++						     glyphs,
++						     segment_start_index,
++						     segment_end_index,
++						     segment_start_glyph,
++						     segment_end_glyph,
++						     cairo_clusters,
++						     num_clusters,
++						     backward,
++						     font,
++						     x, y,
++						     segment_use_hex_box);
++  }
+ 
+   if (cairo_clusters != stack_clusters)
+     g_free (cairo_clusters);
+-- 
+2.53.0
+
+
+From 6615ff351a7bd17452b26cb756737c9c9dd78f71 Mon Sep 17 00:00:00 2001
+From: Behdad Esfahbod <behdad@behdad.org>
+Date: Fri, 20 Mar 2026 10:17:01 -0600
+Subject: [PATCH 2/3] pangocairo: draw hex box frames with fills
+
+This works around a bug in stroke width in cairo type3 font output.
+
+https://gitlab.freedesktop.org/cairo/cairo/-/issues/934
+---
+ pango/pangocairo-font.c | 47 +++++++++++++++++++++++++++++------------
+ 1 file changed, 34 insertions(+), 13 deletions(-)
+
+diff --git a/pango/pangocairo-font.c b/pango/pangocairo-font.c
+index 9e31bf0b..7ffe4972 100644
+--- a/pango/pangocairo-font.c
++++ b/pango/pangocairo-font.c
+@@ -151,25 +151,46 @@ pango_cairo_hex_box_draw_frame (cairo_t  *cr,
+                                 double    line_width,
+                                 gboolean  invalid)
+ {
+-  cairo_rectangle (cr, x, y, width, height);
++  double half_line_width = 0.5 * line_width;
++
++  cairo_set_fill_rule (cr, CAIRO_FILL_RULE_EVEN_ODD);
++  cairo_rectangle (cr,
++                   x - half_line_width,
++                   y - half_line_width,
++                   width + line_width,
++                   height + line_width);
++  cairo_rectangle (cr,
++                   x + half_line_width,
++                   y + half_line_width,
++                   MAX (width - line_width, 0),
++                   MAX (height - line_width, 0));
+ 
+   if (invalid)
+     {
+-      cairo_new_sub_path (cr);
+-      cairo_move_to (cr, x, y);
+-      cairo_rel_line_to (cr, width, height);
+-
+-      cairo_new_sub_path (cr);
+-      cairo_move_to (cr, x + width, y);
+-      cairo_rel_line_to (cr, -width, height);
++      double diagonal_length = hypot (width, height);
+ 
+-      cairo_set_line_cap (cr, CAIRO_LINE_CAP_BUTT);
++      if (diagonal_length > 0)
++        {
++          double dx = half_line_width * height / diagonal_length;
++          double dy = half_line_width * width / diagonal_length;
++
++          cairo_new_sub_path (cr);
++          cairo_move_to (cr, x - dx, y + dy);
++          cairo_line_to (cr, x + dx, y - dy);
++          cairo_line_to (cr, x + width + dx, y + height - dy);
++          cairo_line_to (cr, x + width - dx, y + height + dy);
++          cairo_close_path (cr);
++
++          cairo_new_sub_path (cr);
++          cairo_move_to (cr, x + width + dx, y + dy);
++          cairo_line_to (cr, x + width - dx, y - dy);
++          cairo_line_to (cr, x - dx, y + height - dy);
++          cairo_line_to (cr, x + dx, y + height + dy);
++          cairo_close_path (cr);
++        }
+     }
+ 
+-  cairo_set_line_width (cr, line_width);
+-  cairo_set_line_join (cr, CAIRO_LINE_JOIN_MITER);
+-  cairo_set_miter_limit (cr, 2.);
+-  cairo_stroke (cr);
++  cairo_fill (cr);
+ }
+ 
+ static void
+-- 
+2.53.0
+
+
+From fecd5ec97c3278d7d3280a00d28e0120250ee14e Mon Sep 17 00:00:00 2001
+From: Peng Wu <pwu@redhat.com>
+Date: Mon, 29 Nov 2021 13:21:55 +0800
+Subject: [PATCH 3/3] Fix pango-view crash
+
+Remove cairo_debug_reset_static_data function call in pango-view
+to avoid crash.
+---
+ utils/viewer-pangocairo.c | 2 --
+ 1 file changed, 2 deletions(-)
+
+diff --git a/utils/viewer-pangocairo.c b/utils/viewer-pangocairo.c
+index ac3b49c3..67a57087 100644
+--- a/utils/viewer-pangocairo.c
++++ b/utils/viewer-pangocairo.c
+@@ -90,8 +90,6 @@ pangocairo_view_destroy (gpointer instance)
+ 
+   c->iface->backend_class->destroy (c->backend);
+ 
+-  cairo_debug_reset_static_data ();
+-
+   g_slice_free (CairoViewer, c);
+ }
+ 
+-- 
+2.53.0
+
