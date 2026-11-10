@@ -9,12 +9,13 @@
 
 Name:    pango
 Version: 1.54.0
-Release: 3%{?dist}
+Release: 4%{?dist}
 Summary: System for layout and rendering of internationalized text
 
 License: LGPL-2.0-or-later
 URL:     https://pango.gnome.org/
 Source0: https://download.gnome.org/sources/%{name}/1.54/%{name}-%{version}.tar.xz
+Patch: pango-use-cairo-user-font-el10.patch
 
 BuildRequires: pkgconfig(cairo) >= %{cairo_version}
 BuildRequires: pkgconfig(cairo-gobject) >= %{cairo_version}
@@ -138,6 +139,10 @@ fi
 
 
 %changelog
+* Fri May 8 2026 Sudip Shil <sshil@redhat.com> - 1.54.0-4
+- Fix PDF rendering of unknown glyphs
+- Resolves: RHEL-145621
+
 * Tue Oct 29 2024 Troy Dawson <tdawson@redhat.com> - 1.54.0-3
 - Bump release for October 2024 mass rebuild:
   Resolves: RHEL-64018
